@@ -1069,6 +1069,11 @@
   (contains? allowed-operators (and (list? form)
                                     (first form))))
 
+(defn- load-form?
+  "Determines if the expression is a form that loads code."
+  [expression-form]
+  (call-form? expression-form '#{ns require require-macros import load load-file}))
+
 (defn- def-form?
   "Determines if the expression is a def expression which returns a Var."
   [form]
@@ -1130,8 +1135,10 @@
       (let [form (and expression? (first (repl-read-string source)))
             eval-opts (merge (make-eval-opts)
                         (when expression?
-                          {:context :expr
-                           :def-emits-var true}))]
+                          {:context :expr})
+                        (if (load-form? expression-form)
+                          {:source-map true}
+                          {:def-emits-var true}))]
         (if (repl-special? form)
           ((get repl-special-fns (first form)) form (merge opts eval-opts))
           (cljs/eval-str
