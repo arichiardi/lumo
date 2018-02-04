@@ -862,11 +862,18 @@
 ;; --------------------
 ;; Code evaluation
 
-(defn- make-eval-opts []
+(defn- make-eval-opts [& [{:keys [form initial-ns expression?]}] ]
   (merge
-    {:ns @current-ns
-     :target :nodejs}
-    (select-keys @app-opts [:verbose :static-fns :fn-invoke-direct :checked-arrays])))
+   {:ns (or initial-ns @current-ns)
+    :target :nodejs}
+   (select-keys @app-opts [:verbose :static-fns :fn-invoke-direct :checked-arrays])
+   (if expression?
+     (merge {:context :expr
+             :def-emits-var true
+             :source-map-timestamp false}
+            (when (and form (load-form? form))
+              {:source-map true}))
+     {:source-map false})))
 
 (defn- current-alias?
   [ns]
@@ -1028,6 +1035,14 @@
   (contains? allowed-operators (and (list? form)
                                     (first form))))
 
+(defn- load-form?
+  "Determines if the expression is a form that loads code."
+  [expression-form]
+  (call-form? expression-form '#{require require-macros import
+                                 cljs.core/require cljs.core/require-macros cljs.core/import
+                                 clojure.core/require clojure.core/require-macros clojure.core/import
+                                 ns load load-file}))
+
 (defn- def-form?
   "Determines if the expression is a def expression which returns a Var."
   [form]
@@ -1087,10 +1102,7 @@
               tags/*cljs-data-readers* (merge tags/*cljs-data-readers* (load-data-readers! env/*compiler*))
               r/*alias-map*    (current-alias-map)]
       (let [form (and expression? (first (repl-read-string source)))
-            eval-opts (merge (make-eval-opts)
-                        (when expression?
-                          {:context :expr
-                           :def-emits-var true}))]
+            eval-opts (make-eval-opts {:expression? expression? :form form})]
         (if (repl-special? form)
           ((get repl-special-fns (first form)) form (merge opts eval-opts))
           (cljs/eval-str
@@ -1145,20 +1157,19 @@
 
 (defn- ^:export run-main
   [main-ns & args]
-  (let [main-args (js->clj args)
-        opts (make-eval-opts)]
+  (let [main-args (js->clj args)]
     (binding [cljs/*load-fn* load
               cljs/*eval-fn* caching-node-eval]
       (cljs/eval st
         `(~'require (quote ~(symbol main-ns)))
-        opts
+        (make-eval-opts)
         (fn [{:keys [ns value error] :as ret}]
           (if error
             (handle-error error true)
             (cljs/eval-str st
               (str "(var -main)")
               nil
-              (merge opts {:ns (symbol main-ns)})
+              (make-eval-opts {:initial-ns (symbol main-ns)})
               (fn [{:keys [ns value error] :as ret}]
                 (try
                   (apply value main-args)
@@ -1437,20 +1448,19 @@ This was taken from the reader specification plus tests at the Clojure REPL."}
 (defn ^:export run-accept-fn [accept-fn socket args]
   (let [ns-sym (ns-symbol accept-fn)
         fn-str (fn-string accept-fn)
-        opts (make-eval-opts)
         fn-args (js->clj args)]
     (binding [cljs/*load-fn* load
               cljs/*eval-fn* caching-node-eval]
       (cljs/eval st
         `(~'require (quote ~ns-sym))
-        opts
+        (make-eval-opts)
         (fn [{:keys [ns value error] :as ret}]
           (if error
             (handle-error error true)
             (cljs/eval-str st
               (str "(var " fn-str ")")
               nil
-              (merge opts {:ns (symbol ns-sym)})
+              (make-eval-opts {:initial-ns (symbol ns-sym)})
               (fn [{:keys [ns value error] :as ret}]
                 (try
                   ;; TODO: do we wanna splice args?
