@@ -1149,7 +1149,7 @@
             st
             source
             (cond
-              expression? source
+              expression? (if (load-form? form) (ns-for-source source) source)
               filename (or (ns-for-source source) filename)
               :else "source")
             eval-opts
