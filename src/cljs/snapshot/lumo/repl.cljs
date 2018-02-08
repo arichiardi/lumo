@@ -438,6 +438,71 @@
 ;; --------------------
 ;; Error handling
 
+(declare all-ns ns-syms)
+
+(defn- form-demunge-map
+  "Forms a map from munged function symbols (as they appear in stacktraces)
+  to their unmunged forms."
+  [ns]
+  {:pre [(symbol? ns)]}
+  (let [ns-str        (str ns)
+        munged-ns-str (string/replace ns-str #"\." "$")]
+    (into {} (for [sym (ns-syms ns)]
+               [(str munged-ns-str "$" (munge sym)) (symbol ns-str (str sym))]))))
+
+(def ^:private core-demunge-map
+  (delay (form-demunge-map 'cljs.core)))
+
+(defn- non-core-demunge-maps
+  []
+  (let [non-core-nss (remove #{'cljs.core 'cljs.core$macros} (all-ns))]
+    (map form-demunge-map non-core-nss)))
+
+(defn- lookup-sym
+  [demunge-maps munged-sym]
+  (some #(% munged-sym) demunge-maps))
+
+(defn- demunge-local
+  [demunge-maps munged-sym]
+  (let [[_ fn local] (re-find #"(.*)_\$_(.*)" munged-sym)]
+    (when fn
+      (when-let [fn-sym (lookup-sym demunge-maps fn)]
+        (str fn-sym " " (demunge local))))))
+
+(defn- demunge-protocol-fn
+  [demunge-maps munged-sym]
+  (let [[_ ns prot fn] (re-find #"(.*)\$(.*)\$(.*)\$arity\$.*" munged-sym)]
+    (when ns
+      (when-let [prot-sym (lookup-sym demunge-maps (str ns "$" prot))]
+        (when-let [fn-sym (lookup-sym demunge-maps (str ns "$" fn))]
+          (str fn-sym " [" prot-sym "]"))))))
+
+(defn- gensym?
+  [sym]
+  (string/starts-with? (name sym) "G__"))
+
+(defn- demunge-sym
+  [munged-sym]
+  (let [demunge-maps (cons @core-demunge-map (non-core-demunge-maps))]
+    (str (or (lookup-sym demunge-maps munged-sym)
+             (demunge-protocol-fn demunge-maps munged-sym)
+             (demunge-local demunge-maps munged-sym)
+             (if (gensym? munged-sym)
+               munged-sym
+               (demunge munged-sym))))))
+
+(defn- mapped-stacktrace-str
+  ([stacktrace sms]
+   (mapped-stacktrace-str stacktrace sms nil))
+  ([stacktrace sms opts]
+   (apply str
+          (for [{:keys [function file line column]} (st/mapped-stacktrace stacktrace sms opts)
+                :let [demunged (str (when function (demunge-sym function)))]
+                :when (not= demunged "cljs.core/-invoke [cljs.core/IFn]")]
+            (do (println "---" function file line column demunged)
+                (str \tab demunged " (" file (when line (str ":" line))
+                     (when column (str ":" column)) ")" \newline))))))
+
 (defn- ^:boolean could-not-eval? [msg]
   (and (not (nil? msg)) (boolean (re-find could-not-eval-regex msg))))
 
@@ -476,8 +541,6 @@
                (:file data))
       (str " at line " (:line data) " " (:file data)#_(file-path (:file data))))))
 
-(declare all-ns ns-syms)
-
 (defn- print-error
   ([error stacktrace?]
    (print-error error stacktrace? nil))
@@ -493,16 +556,23 @@
        #_(when-let [data (and print-ex-data? (ex-data error))]
          (print-value data {::as-code? false}))
        (when stacktrace?
-         (let [canonical-stacktrace (st/parse-stacktrace
-                                      {}
-                                      (.-stack error)
-                                      {:ua-product :nodejs}
-                                      {:output-dir "file://(/goog/..)?"})]
+         (let [canonical-stacktrace (->> (st/parse-stacktrace
+                                          {}
+                                          (.-stack error)
+                                          {:ua-product :nodejs}
+                                          {:output-dir "file://(/goog/..)?"})
+                                         ;; get rid of this fix when the CLJS patches are in
+                                         (mapv #(update % :file
+                                                        (fn [file]
+                                                          (-> file
+                                                              ;; https://dev.clojure.org/jira/browse/CLJS-2493
+                                                              (string/replace #"(\?rel.*)$" "")
+                                                              ;; https://dev.clojure.org/jira/browse/CLJS-2492
+                                                              (string/replace #"_" "-"))))))]
            (println
-             (st/mapped-stacktrace-str
-               canonical-stacktrace
-               {}
-               nil))))
+            (st/mapped-stacktrace-str
+             canonical-stacktrace
+             (or (:source-maps @st) {})))))
        (when-let [cause (.-cause error)]
          (recur cause stacktrace? message))))))
 
