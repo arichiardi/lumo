@@ -438,6 +438,71 @@
 ;; --------------------
 ;; Error handling
 
+(declare all-ns ns-syms)
+
+(defn- form-demunge-map
+  "Forms a map from munged function symbols (as they appear in stacktraces)
+  to their unmunged forms."
+  [ns]
+  {:pre [(symbol? ns)]}
+  (let [ns-str        (str ns)
+        munged-ns-str (string/replace ns-str #"\." "$")]
+    (into {} (for [sym (ns-syms ns)]
+               [(str munged-ns-str "$" (munge sym)) (symbol ns-str (str sym))]))))
+
+(def ^:private core-demunge-map
+  (delay (form-demunge-map 'cljs.core)))
+
+(defn- non-core-demunge-maps
+  []
+  (let [non-core-nss (remove #{'cljs.core 'cljs.core$macros} (all-ns))]
+    (map form-demunge-map non-core-nss)))
+
+(defn- lookup-sym
+  [demunge-maps munged-sym]
+  (some #(% munged-sym) demunge-maps))
+
+(defn- demunge-local
+  [demunge-maps munged-sym]
+  (let [[_ fn local] (re-find #"(.*)_\$_(.*)" munged-sym)]
+    (when fn
+      (when-let [fn-sym (lookup-sym demunge-maps fn)]
+        (str fn-sym " " (demunge local))))))
+
+(defn- demunge-protocol-fn
+  [demunge-maps munged-sym]
+  (let [[_ ns prot fn] (re-find #"(.*)\$(.*)\$(.*)\$arity\$.*" munged-sym)]
+    (when ns
+      (when-let [prot-sym (lookup-sym demunge-maps (str ns "$" prot))]
+        (when-let [fn-sym (lookup-sym demunge-maps (str ns "$" fn))]
+          (str fn-sym " [" prot-sym "]"))))))
+
+(defn- gensym?
+  [sym]
+  (string/starts-with? (name sym) "G__"))
+
+(defn- demunge-sym
+  [munged-sym]
+  (let [demunge-maps (cons @core-demunge-map (non-core-demunge-maps))]
+    (str (or (lookup-sym demunge-maps munged-sym)
+             (demunge-protocol-fn demunge-maps munged-sym)
+             (demunge-local demunge-maps munged-sym)
+             (if (gensym? munged-sym)
+               munged-sym
+               (demunge munged-sym))))))
+
+(defn- mapped-stacktrace-str
+  ([stacktrace sms]
+   (mapped-stacktrace-str stacktrace sms nil))
+  ([stacktrace sms opts]
+   (apply str
+          (for [{:keys [function file line column]} (st/mapped-stacktrace stacktrace sms opts)
+                :let [demunged (str (when function (demunge-sym function)))]
+                :when (not= demunged "cljs.core/-invoke [cljs.core/IFn]")]
+            (do (println "---" function file line column demunged)
+                (str \tab demunged " (" file (when line (str ":" line))
+                     (when column (str ":" column)) ")" \newline))))))
+
 (defn- ^:boolean could-not-eval? [msg]
   (and (not (nil? msg)) (boolean (re-find could-not-eval-regex msg))))
 
@@ -476,8 +541,6 @@
                (:file data))
       (str " at line " (:line data) " " (:file data)#_(file-path (:file data))))))
 
-(declare all-ns ns-syms)
-
 (defn- print-error
   ([error stacktrace?]
    (print-error error stacktrace? nil))
@@ -493,16 +556,23 @@
        #_(when-let [data (and print-ex-data? (ex-data error))]
          (print-value data {::as-code? false}))
        (when stacktrace?
-         (let [canonical-stacktrace (st/parse-stacktrace
-                                      {}
-                                      (.-stack error)
-                                      {:ua-product :nodejs}
-                                      {:output-dir "file://(/goog/..)?"})]
+         (let [canonical-stacktrace (->> (st/parse-stacktrace
+                                          {}
+                                          (.-stack error)
+                                          {:ua-product :nodejs}
+                                          {:output-dir "file://(/goog/..)?"})
+                                         ;; get rid of this fix when the CLJS patches are in
+                                         (mapv #(update % :file
+                                                        (fn [file]
+                                                          (-> file
+                                                              ;; https://dev.clojure.org/jira/browse/CLJS-2493
+                                                              (string/replace #"(\?rel.*)$" "")
+                                                              ;; https://dev.clojure.org/jira/browse/CLJS-2492
+                                                              (string/replace #"_" "-"))))))]
            (println
-             (st/mapped-stacktrace-str
-               canonical-stacktrace
-               {}
-               nil))))
+            (st/mapped-stacktrace-str
+             canonical-stacktrace
+             (or (:source-maps @st) {})))))
        (when-let [cause (.-cause error)]
          (recur cause stacktrace? message))))))
 
@@ -903,12 +973,6 @@
 ;; --------------------
 ;; Code evaluation
 
-(defn- make-eval-opts []
-  (merge
-    {:ns @current-ns
-     :target :nodejs}
-    (select-keys @app-opts [:verbose :static-fns :fn-invoke-direct :checked-arrays])))
-
 (defn- current-alias?
   [ns]
   (contains? (set (vals (current-alias-map))) ns))
@@ -1069,6 +1133,14 @@
   (contains? allowed-operators (and (list? form)
                                     (first form))))
 
+(defn- load-form?
+  "Determines if the expression is a form that loads code."
+  [expression-form]
+  (call-form? expression-form '#{require require-macros import
+                                 cljs.core/require cljs.core/require-macros cljs.core/import
+                                 clojure.core/require clojure.core/require-macros clojure.core/import
+                                 ns load load-file}))
+
 (defn- def-form?
   "Determines if the expression is a def expression which returns a Var."
   [form]
@@ -1084,6 +1156,18 @@
           (do ;when (show-indicator?)
             (println (form-indicator-str column @current-ns))))
         (print warning-string)))))
+
+(defn- make-eval-opts [& [{:keys [form initial-ns expression?]}] ]
+  (merge
+   {:ns (or initial-ns @current-ns)
+    :target :nodejs}
+    (select-keys @app-opts [:verbose :static-fns :fn-invoke-direct :checked-arrays])
+    (if expression?
+      (merge {:context :expr
+              :def-emits-var true}
+             (when (and form (load-form? form))
+               {:source-map true}))
+      {:source-map true})))
 
 (declare execute-source)
 
@@ -1128,17 +1212,14 @@
               tags/*cljs-data-readers* (merge tags/*cljs-data-readers* (load-data-readers! env/*compiler*))
               r/*alias-map*    (current-alias-map)]
       (let [form (and expression? (first (repl-read-string source)))
-            eval-opts (merge (make-eval-opts)
-                        (when expression?
-                          {:context :expr
-                           :def-emits-var true}))]
+            eval-opts (make-eval-opts {:expression? expression? :form form})]
         (if (repl-special? form)
           ((get repl-special-fns (first form)) form (merge opts eval-opts))
           (cljs/eval-str
             st
             source
             (cond
-              expression? source
+              expression? (if (load-form? form) (ns-for-source source) source)
               filename (or (ns-for-source source) filename)
               :else "source")
             eval-opts
@@ -1187,20 +1268,19 @@
 
 (defn- ^:export run-main
   [main-ns & args]
-  (let [main-args (js->clj args)
-        opts (make-eval-opts)]
+  (let [main-args (js->clj args)]
     (binding [cljs/*load-fn* load
               cljs/*eval-fn* caching-node-eval]
       (cljs/eval st
         `(~'require (quote ~(symbol main-ns)))
-        opts
+        (make-eval-opts)
         (fn [{:keys [ns value error] :as ret}]
           (if error
             (handle-error error true)
             (cljs/eval-str st
               (str "(var -main)")
               nil
-              (merge opts {:ns (symbol main-ns)})
+              (make-eval-opts {:initial-ns (symbol main-ns)})
               (fn [{:keys [ns value error] :as ret}]
                 (try
                   (apply value main-args)
@@ -1479,20 +1559,19 @@ This was taken from the reader specification plus tests at the Clojure REPL."}
 (defn ^:export run-accept-fn [accept-fn socket args]
   (let [ns-sym (ns-symbol accept-fn)
         fn-str (fn-string accept-fn)
-        opts (make-eval-opts)
         fn-args (js->clj args)]
     (binding [cljs/*load-fn* load
               cljs/*eval-fn* caching-node-eval]
       (cljs/eval st
         `(~'require (quote ~ns-sym))
-        opts
+        (make-eval-opts)
         (fn [{:keys [ns value error] :as ret}]
           (if error
             (handle-error error true)
             (cljs/eval-str st
               (str "(var " fn-str ")")
               nil
-              (merge opts {:ns (symbol ns-sym)})
+              (make-eval-opts {:initial-ns (symbol ns-sym)})
               (fn [{:keys [ns value error] :as ret}]
                 (try
                   ;; TODO: do we wanna splice args?
